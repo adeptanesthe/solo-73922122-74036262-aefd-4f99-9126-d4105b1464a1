@@ -151,6 +151,42 @@ def read_filtered(
     return rows, total, scanned
 
 
+def read_export_rows(
+    lake_dir: str,
+    rel_paths: Iterable[str],
+    turbine: str,
+    start: datetime,
+    end: datetime,
+) -> tuple[list[datetime], list[float]]:
+    """读取快照文件内某机组某 UTC 日的全部 (ts, vibration)，按时间升序。
+
+    不做去重：同一时刻的多条读数原样返回，由导出层按规则合并 / 报冲突。
+    """
+    frames: list[pa.Table] = []
+    for rel in rel_paths:
+        table = pq.read_table(_abs(lake_dir, rel), schema=SCHEMA)
+        mask = pc.and_(
+            pc.equal(table["turbine"], turbine),
+            pc.and_(
+                pc.greater_equal(
+                    table["ts_utc"], pa.scalar(start, type=table["ts_utc"].type)
+                ),
+                pc.less(table["ts_utc"], pa.scalar(end, type=table["ts_utc"].type)),
+            ),
+        )
+        table = table.filter(mask)
+        if table.num_rows:
+            frames.append(table)
+    if not frames:
+        return [], []
+    combined = pa.concat_tables(frames, promote_options="default")
+    combined = combined.sort_by([("ts_utc", "ascending")])
+    return (
+        combined.column("ts_utc").to_pylist(),
+        combined.column("vibration").to_pylist(),
+    )
+
+
 def merge_files(lake_dir: str, rel_paths: Sequence[str]) -> pa.Table:
     """按文件名顺序拼接多个 Parquet，保留全部重复行。"""
     tables = [pq.read_table(_abs(lake_dir, rel), schema=SCHEMA) for rel in rel_paths]

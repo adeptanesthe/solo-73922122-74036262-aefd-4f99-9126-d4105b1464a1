@@ -131,4 +131,60 @@ with TestClient(app) as client:
     assert stats["totals"]["active_files"] == 2  # 每日 1 个压实件
     assert stats["totals"]["partitions"] == 2
 
+    # ---------------- 训练数据导出 ----------------
+    print("\n-- training export --")
+    opts = client.get("/api/exports/options").json()
+    print("export options:", opts)
+    assert "WTG-07" in opts["turbines"] and "2026-11-13" in opts["days"]
+
+    r = client.post("/api/exports?turbine=WTG-07&day=2026-11-13")
+    assert r.status_code == 201, r.text
+    export = r.json()
+    print("export published:", export["export_id"], export["row_count"], "rows")
+    assert export["source_rows"] == 3  # 08:00 ×2 + 08:01
+    assert export["row_count"] == 2   # 08:00 同值合并
+    assert export["source_file_count"] == 1  # 该日已压实为 1 个文件
+    assert len(export["source_file_ids"]) == 1
+
+    # 登记与列表
+    listed = client.get("/api/exports").json()
+    assert any(e["id"] == export["export_id"] for e in listed)
+    detail = client.get(f"/api/exports/{export['export_id']}").json()
+    assert detail["source_rows"] == 3 and detail["source_file_ids"] == export["source_file_ids"]
+    print("export registry:", detail["id"], "source files", detail["source_file_ids"])
+
+    # 下载
+    dl = client.get(f"/api/exports/{export['export_id']}/download")
+    assert dl.status_code == 200, dl.text
+    assert dl.headers["content-type"].startswith("text/csv")
+    lines = dl.text.strip().splitlines()
+    print("downloaded CSV:", lines)
+    assert lines[0] == "turbine,ts_utc,vibration,row_count"
+    assert len(lines) == 3
+    assert lines[1].startswith("WTG-07,2026-11-13T08:00:00Z,1.5,2")
+    assert lines[2].startswith("WTG-07,2026-11-13T08:01:00Z,2.5,1")
+
+    # 同刻异值：409 且不发布
+    bad = (
+        b"turbine,ts_utc,vibration\n"
+        b"WTG-88,2026-11-13T08:00:00Z,1.0\n"
+        b"WTG-88,2026-11-13T08:00:00Z,2.0\n"
+    )
+    assert client.post("/api/readings", files={"file": ("c.csv", bad, "text/csv")}).status_code == 200
+    before = client.get("/api/exports").json()
+    r = client.post("/api/exports?turbine=WTG-88&day=2026-11-13")
+    assert r.status_code == 409, r.text
+    body = r.json()
+    print("conflict 409:", body["detail"], body["conflicts"])
+    assert body["published"] is False and body["conflict_count"] == 1
+    assert body["conflicts"][0]["ts_utc"] == "2026-11-13T08:00:00Z"
+    assert sorted(body["conflicts"][0]["values"]) == [1.0, 2.0]
+    assert len(client.get("/api/exports").json()) == len(before)
+
+    # 无数据 / 非法参数
+    assert client.post("/api/exports?turbine=NO-SUCH&day=2026-11-13").status_code == 404
+    assert client.post("/api/exports?turbine=WTG-07&day=bad-date").status_code == 422
+    print("export error handling: 404 / 422 ok")
+
+
 print("\nHTTP 冒烟测试全部通过 ✅")

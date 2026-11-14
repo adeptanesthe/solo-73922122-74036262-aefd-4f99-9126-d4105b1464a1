@@ -168,7 +168,36 @@
   </section>
 
   <section class="panel">
-    <h2>⑤ 压实（一次只压实一份日分区；启动时固定该日文件，期间新上传文件保留）</h2>
+    <h2>⑤ 导出训练数据（按机组 + UTC 日，受理时固定文件集合）</h2>
+    <div class="row">
+      <div>
+        <label>机组号（来自当前数据）</label>
+        <select id="exportTurbine"><option value="">加载中…</option></select>
+      </div>
+      <div>
+        <label>UTC 日（来自当前数据）</label>
+        <select id="exportDay"><option value="">加载中…</option></select>
+      </div>
+      <div style="display:flex;align-items:flex-end">
+        <button id="exportBtn">生成训练 CSV</button>
+      </div>
+    </div>
+    <div class="hint">
+      同一时刻同值合并为一行（<code>row_count</code> 列记原行数）；同一时刻出现不同振动值时
+      列出时刻与全部取值，本次不发布。导出期间的上传 / 压实不影响结果，旧件回收不打断读取。
+    </div>
+    <div class="hint" id="exportMeta">尚未导出</div>
+    <div class="scroll" style="margin-top:10px">
+      <table>
+        <thead><tr><th>导出文件 ID</th><th>机组</th><th>UTC 日</th><th>输出行数</th>
+          <th>源行数</th><th>来源文件数</th><th>生成时间</th><th>下载</th></tr></thead>
+        <tbody id="exportBody"><tr><td colspan="8" class="muted">暂无导出记录</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>⑥ 压实（一次只压实一份日分区；启动时固定该日文件，期间新上传文件保留）</h2>
     <div class="row">
       <div>
         <label>UTC 日分区</label>
@@ -207,7 +236,10 @@ async function api(path, options = {}) {
   try { body = await resp.json(); } catch { /* 非 JSON */ }
   if (!resp.ok) {
     const detail = body && body.detail ? body.detail : `HTTP ${resp.status}`;
-    throw new Error(detail);
+    const err = new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+    err.body = body;
+    err.status = resp.status;
+    throw err;
   }
   return body;
 }
@@ -328,6 +360,69 @@ $("queryBtn").onclick = async () => {
   }
 };
 
+// ---------- 导出 ----------
+async function refreshExportOptions() {
+  try {
+    const o = await api("/api/exports/options");
+    const curTurbine = $("exportTurbine").value;
+    const curDay = $("exportDay").value;
+    $("exportTurbine").innerHTML = o.turbines.length
+      ? o.turbines.map((t) => `<option value="${esc(t)}">${esc(t)}</option>`).join("")
+      : '<option value="">暂无机组</option>';
+    $("exportDay").innerHTML = o.days.length
+      ? o.days.map((d) => `<option value="${esc(d)}">${esc(d)}</option>`).join("")
+      : '<option value="">暂无日期</option>';
+    if (curTurbine && o.turbines.includes(curTurbine)) $("exportTurbine").value = curTurbine;
+    if (curDay && o.days.includes(curDay)) $("exportDay").value = curDay;
+    if (!o.turbines.length) $("exportBtn").disabled = true;
+    else $("exportBtn").disabled = false;
+  } catch { /* ignore */ }
+}
+
+async function refreshExports() {
+  try {
+    const rows = await api("/api/exports");
+    $("exportBody").innerHTML = rows.length
+      ? rows.map((e) => `<tr><td><code>${esc(e.id)}</code></td><td>${esc(e.turbine)}</td>
+          <td>${esc(e.day)}</td><td>${e.row_count}</td><td>${e.source_rows}</td>
+          <td>${e.source_file_count}</td><td>${esc(e.created_at)}</td>
+          <td><a href="${esc(e.download_url)}" style="color:var(--accent)">下载</a></td></tr>`).join("")
+      : '<tr><td colspan="8" class="muted">暂无导出记录</td></tr>';
+  } catch { /* ignore */ }
+}
+
+$("exportBtn").onclick = async () => {
+  const turbine = $("exportTurbine").value.trim();
+  const day = $("exportDay").value.trim();
+  if (!turbine || !day) return toast("请输入机组号和 UTC 日", "err");
+  $("exportMeta").textContent = "导出中（读取受理时的文件集合）…";
+  try {
+    const r = await api(`/api/exports?turbine=${encodeURIComponent(turbine)}&day=${encodeURIComponent(day)}`,
+      { method: "POST" });
+    $("exportMeta").innerHTML = `已发布 <code>${esc(r.export_id)}</code>：输出 <strong>${r.row_count}</strong> 行，`
+      + `源 <strong>${r.source_rows}</strong> 行（合并 ${r.merged_rows} 行重复读数），`
+      + `来源 <strong>${r.source_file_count}</strong> 个文件`
+      + ` <a href="${esc(r.download_url)}" style="color:var(--accent)">下载</a>`;
+    toast(`训练 CSV 已生成：${r.row_count} 行 → ${r.export_id}`, "ok");
+    refreshExports();
+    refreshExportOptions();
+  } catch (e) {
+    if (e.body && e.body.conflicts) {
+      const rows = e.body.conflicts.map((c) =>
+        `<tr><td>${esc(c.ts_utc)}</td><td>${c.values.map((v) => esc(v)).join(" / ")}</td>
+         <td>${c.row_count ?? ""}</td></tr>`).join("");
+      $("exportMeta").innerHTML = `<span class="pill fail">未发布</span> ${esc(e.message)}`
+        + `<div class="scroll" style="margin-top:8px"><table><thead><tr>`
+        + `<th>UTC 时刻</th><th>不同振动值</th><th>原行数</th></tr></thead>`
+        + `<tbody>${rows}</tbody></table></div>`;
+    } else {
+      $("exportMeta").textContent = "导出未发布：" + e.message;
+    }
+    toast("导出未发布：" + e.message, "err");
+    refreshExports();
+  }
+};
+
 // ---------- 压实 ----------
 $("compactBtn").onclick = async () => {
   const day = $("compactDay").value.trim();
@@ -341,7 +436,10 @@ $("compactBtn").onclick = async () => {
 };
 
 refreshStats();
+refreshExports();
+refreshExportOptions();
 setInterval(refreshStats, 3000);
+setInterval(refreshExportOptions, 5000);
 </script>
 </body>
 </html>

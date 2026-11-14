@@ -33,6 +33,8 @@ class Settings:
     demo_rows_default: int = _env_int("VIBLAKE_DEMO_ROWS", 200)
     # 测试钩子：压实发布前额外延时（毫秒），默认 0，生产不开启
     compact_delay_ms: int = _env_int("VIBLAKE_COMPACT_DELAY_MS", 0)
+    # 导出冲突明细最多返回多少条（完整冲突数以 conflict_count 给出）
+    export_conflict_detail_limit: int = _env_int("VIBLAKE_EXPORT_CONFLICT_LIMIT", 500)
 
     @property
     def lake_dir(self) -> str:
@@ -41,6 +43,10 @@ class Settings:
     @property
     def db_path(self) -> str:
         return os.path.join(self.data_dir, "meta.db")
+
+    @property
+    def exports_dir(self) -> str:
+        return os.path.join(self.data_dir, "exports")
 
 
 settings = Settings()

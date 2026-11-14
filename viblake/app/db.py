@@ -65,6 +65,25 @@ CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+-- 训练数据导出：文件、来源文件 ID、源行数在同一个事务内登记
+CREATE TABLE IF NOT EXISTS exports (
+    id          TEXT PRIMARY KEY,
+    turbine     TEXT NOT NULL,
+    day         TEXT NOT NULL,              -- UTC 日分区 YYYY-MM-DD
+    path        TEXT NOT NULL UNIQUE,       -- 相对 exports_dir 的路径
+    row_count   INTEGER NOT NULL,           -- 合并后输出行数
+    source_rows INTEGER NOT NULL,           -- 受理时快照内匹配的源行数
+    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_exports_turbine_day ON exports(turbine, day);
+
+CREATE TABLE IF NOT EXISTS export_files (
+    export_id   TEXT NOT NULL REFERENCES exports(id),
+    file_id     TEXT NOT NULL REFERENCES files(id),
+    PRIMARY KEY (export_id, file_id)
+);
+CREATE INDEX IF NOT EXISTS idx_ef_export ON export_files(export_id);
 """
 
 
@@ -336,3 +355,96 @@ class Database:
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 (key, value),
             )
+
+    # ---------- 训练数据导出 ----------
+
+    async def insert_export(
+        self,
+        export_id: str,
+        turbine: str,
+        day: str,
+        rel_path: str,
+        row_count: int,
+        source_rows: int,
+        source_file_ids: Sequence[str],
+    ) -> None:
+        """成功导出后，文件路径、来源文件 ID 与源行数在同一事务内登记。"""
+        async with self.tx() as conn:
+            await conn.execute(
+                "INSERT INTO exports(id, turbine, day, path, row_count, source_rows) "
+                "VALUES (?,?,?,?,?,?)",
+                (export_id, turbine, day, rel_path, row_count, source_rows),
+            )
+            await conn.executemany(
+                "INSERT OR IGNORE INTO export_files(export_id, file_id) VALUES (?,?)",
+                [(export_id, fid) for fid in source_file_ids],
+            )
+
+    async def get_export(self, export_id: str) -> aiosqlite.Row | None:
+        return await self.query_one(
+            "SELECT * FROM exports WHERE id=?", (export_id,)
+        )
+
+    async def list_exports(self, limit: int = 50) -> list[aiosqlite.Row]:
+        return await self.query_all(
+            """
+            SELECT e.*,
+                   (SELECT COUNT(*) FROM export_files ef WHERE ef.export_id = e.id)
+                   AS source_file_count
+            FROM exports e ORDER BY e.created_at DESC, e.id DESC LIMIT ?
+            """,
+            (limit,),
+        )
+
+    async def export_source_file_ids(self, export_id: str) -> list[str]:
+        rows = await self.query_all(
+            "SELECT file_id FROM export_files WHERE export_id=? ORDER BY file_id",
+            (export_id,),
+        )
+        return [r["file_id"] for r in rows]
+
+    async def export_options(self) -> tuple[list[str], list[str]]:
+        """可导出的机组与 UTC 日（来自当前 active 文件）。"""
+        turbines = await self.query_all(
+            """
+            SELECT DISTINCT ft.turbine AS turbine
+            FROM file_turbines ft JOIN files f ON f.id = ft.file_id
+            WHERE f.state = 'active'
+            ORDER BY ft.turbine
+            """
+        )
+        days = await self.query_all(
+            "SELECT DISTINCT day FROM files WHERE state='active' ORDER BY day"
+        )
+        return [r["turbine"] for r in turbines], [r["day"] for r in days]
+
+    async def all_export_paths(self) -> set[str]:
+        rows = await self.query_all("SELECT path FROM exports")
+        return {r["path"] for r in rows}
+
+    async def release_all_open_snapshots(self) -> int:
+        """重启时清理上一个进程遗留的读快照引用，使旧件回收可以继续。"""
+        async with self.tx() as conn:
+            rows = await self._fetch_all(
+                conn, "SELECT id FROM snapshots WHERE released_at IS NULL", ()
+            )
+            ids = [int(r["id"]) for r in rows]
+            if not ids:
+                return 0
+            placeholders = ",".join("?" for _ in ids)
+            await conn.execute(
+                f"DELETE FROM snapshot_files WHERE snapshot_id IN ({placeholders})",
+                ids,
+            )
+            await conn.execute(
+                f"UPDATE snapshots SET released_at="
+                f"strftime('%Y-%m-%dT%H:%M:%fZ','now'), refcount=0 "
+                f"WHERE id IN ({placeholders})",
+                ids,
+            )
+            return len(ids)
+
+    @staticmethod
+    async def _fetch_all(conn: aiosqlite.Connection, sql: str, params: Sequence[Any]):
+        async with conn.execute(sql, params) as cur:
+            return list(await cur.fetchall())

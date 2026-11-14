@@ -10,13 +10,14 @@ from pathlib import Path
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 
+from . import export_store as es
 from . import parquet_store as ps
 from .compaction import CompactionError, CompactionManager
 from .config import settings
 from .csv_import import ValidationError
 from .db import Database
 from .gates import PauseGate
-from .service import DataLakeService
+from .service import DataLakeService, ExportNotFound, ExportRejected
 
 logger = logging.getLogger("viblake")
 
@@ -50,9 +51,18 @@ async def lifespan(app: FastAPI):
     )
     os.makedirs(settings.data_dir, exist_ok=True)
     ps.ensure_dirs(settings.lake_dir)
+    es.ensure_dirs(settings.exports_dir)
     await db.connect()
     await gate.load(db)
+    # 上次进程遗留在途的读快照释放掉，旧件回收才能继续
+    released = await db.release_all_open_snapshots()
+    if released:
+        logger.info("启动恢复：释放 %d 个遗留读快照", released)
     recovery = await compaction.recover()
+    export_recovery = await service.recover_exports()
+    recovery["snapshots_released"] = released
+    recovery["export_temp_removed"] = export_recovery["temp_removed"]
+    recovery["export_orphans_removed"] = export_recovery["orphans_removed"]
     if any(recovery.values()):
         logger.info("启动恢复结果: %s", recovery)
     await compaction.start_reaper()
@@ -145,6 +155,80 @@ async def compaction_status(compaction_id: int):
 @app.get("/api/compactions")
 async def compaction_history():
     return await service.compaction_history()
+
+
+# ---------------- 训练数据导出 ----------------
+
+@app.get("/api/exports/options")
+async def export_options():
+    """页面下拉框数据：当前 active 数据中存在的机组与 UTC 日。"""
+    turbines, days = await db.export_options()
+    return {"turbines": turbines, "days": days}
+
+
+@app.post("/api/exports", status_code=201)
+async def create_export(
+    turbine: str = Query(..., description="机组号，例如 WTG-01"),
+    day: str = Query(..., description="UTC 日，格式 YYYY-MM-DD"),
+):
+    """从受理时的活动文件生成按时间排序的训练 CSV。
+
+    - 同刻同值合并为一行，`row_count` 列记录原行数；
+    - 同刻异值返回 409，列出时刻与全部取值，本次不发布任何文件；
+    - 成功返回 201，含导出文件 ID、来源文件 ID 与源行数，可下载。
+    """
+    try:
+        return await service.export_training_csv(turbine, day)
+    except ExportRejected as exc:
+        # 直接返回结构化冲突明细；当 conflicts 为空时 409 响应可能为空体，
+        # 这里保持显式 JSONResponse 以免响应体被省略。
+        return JSONResponse(
+            status_code=409,
+            content={
+                "detail": str(exc),
+                "conflict_count": exc.conflict_count,
+                "conflicts": exc.conflicts,
+                "conflicts_truncated": exc.truncated,
+                "published": False,
+            },
+        )
+    except es.ExportEmpty as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.get("/api/exports")
+async def list_exports():
+    return await service.list_exports()
+
+
+@app.get("/api/exports/{export_id}")
+async def get_export(export_id: str):
+    try:
+        return await service.get_export(export_id)
+    except ExportNotFound as exc:
+        raise HTTPException(status_code=404, detail="导出文件不存在") from exc
+
+
+@app.get("/api/exports/{export_id}/download")
+async def download_export(export_id: str):
+    row = await db.get_export(export_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="导出文件不存在")
+    path = service.export_abs_path(row)
+    if not os.path.isfile(path):
+        raise HTTPException(status_code=410, detail="导出文件已不存在")
+    safe_turbine = "".join(
+        ch if ch.isalnum() or ch in "-_." else "_" for ch in str(row["turbine"])
+    )
+    filename = f"{safe_turbine}_{row['day']}_training.csv"
+    return FileResponse(
+        path,
+        media_type="text/csv",
+        filename=filename,
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 # ---------------- 演示开关 ----------------

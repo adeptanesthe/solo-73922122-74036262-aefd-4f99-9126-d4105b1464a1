@@ -8,6 +8,7 @@ import os
 import shutil
 import socket
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -17,8 +18,9 @@ DATA = Path("/tmp/viblake-crash-drill")
 if DATA.exists():
     shutil.rmtree(DATA)
 
-PY = "/workspace/.venv/bin/python"
-ROOT = "/workspace/viblake"
+# 优先使用当前解释器（容器 / 系统安装均可），保留 .venv 作为回退
+PY = sys.executable if Path(sys.executable).exists() else "/workspace/.venv/bin/python"
+ROOT = Path(__file__).resolve().parent.parent
 
 
 def free_port() -> int:

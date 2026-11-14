@@ -3,15 +3,35 @@ from __future__ import annotations
 
 import asyncio
 import math
+import os
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
+from . import export_store as es
 from . import parquet_store as ps
 from .compaction import CompactionError, CompactionManager
 from .config import Settings
 from .csv_import import parse_readings
 from .db import Database
 from .gates import PauseGate
+
+
+class ExportNotFound(LookupError):
+    pass
+
+
+class ExportRejected(ValueError):
+    """导出因同刻异值被拒绝；conflicts/conflict_count 供 HTTP 层返回明细。"""
+
+    def __init__(
+        self, conflicts: list[dict], conflict_count: int, truncated: bool = False
+    ) -> None:
+        self.conflicts = conflicts
+        self.conflict_count = conflict_count
+        self.truncated = truncated
+        super().__init__(
+            f"同一时刻存在 {conflict_count} 个不同振动值的时间点，本次不发布导出文件"
+        )
 
 
 class Snapshot:
@@ -128,6 +148,147 @@ class DataLakeService:
             "limit": limit,
             "rows": rows,
         }
+
+    # ---------------- 训练数据导出 ----------------
+
+    async def export_training_csv(
+        self, turbine: str, day: str, *, fail_after_publish: bool = False
+    ) -> dict[str, object]:
+        """按机组 + UTC 日，从受理时的活动文件生成训练 CSV。
+
+        - 受理时在单个事务内固定文件集合（写读快照），导出全程只读这些文件，
+          期间的上传 / 压实不会改变本次结果，旧件回收也不会打断读取；
+        - 同一时刻同值合并为一行并记录原行数；同刻异值则整体拒绝、不发布；
+        - 文件先写 exports/_tmp 并 fsync，再原子改名，最后在单事务内登记
+          文件路径 + 来源文件 ID + 源行数；登记失败则删除成品。
+        """
+        turbine = turbine.strip()
+        if not turbine:
+            raise ValueError("机组号不能为空")
+        try:
+            base = datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        except ValueError as exc:
+            raise ValueError(f"日期格式非法: {day!r}（需 YYYY-MM-DD）") from exc
+        # 统一为零填充 ISO 日期，与文件分区 day=YYYY-MM-DD 对齐
+        day = base.date().isoformat()
+        start = base
+        end = base + timedelta(days=1)
+
+        # 暂停查询开关同样适用于导出读取（服务端等待，恢复后继续）
+        await self._gate.wait_query_open()
+
+        snapshot_id, files = await self._db.create_snapshot(turbine, day, day)
+        try:
+            rel_paths = [f["path"] for f in files]
+            ts_values, vibrations = await self._io(
+                ps.read_export_rows,
+                self._settings.lake_dir,
+                rel_paths,
+                turbine,
+                start,
+                end,
+            )
+            merged, conflicts = es.merge_duplicate_timestamps(ts_values, vibrations)
+            source_rows = len(ts_values)
+            if conflicts:
+                limit = self._settings.export_conflict_detail_limit
+                raise ExportRejected(
+                    conflicts[:limit], len(conflicts), truncated=len(conflicts) > limit
+                )
+            if not merged:
+                raise es.ExportEmpty(
+                    f"机组 {turbine} 在 UTC 日 {day} 没有可导出的读数"
+                )
+
+            export_id = es.new_export_id()
+            payload = es.build_csv(turbine, merged)
+            rel_tmp = await self._io(
+                es.write_temp, self._settings.exports_dir, export_id, payload
+            )
+            rel_final = ""
+            try:
+                rel_final = await self._io(
+                    es.publish_temp, self._settings.exports_dir, export_id, rel_tmp
+                )
+                # 测试钩子：发布后、登记前延时，便于演练“中途退出”留下孤儿 CSV
+                if delay_ms := int(os.environ.get("VIBLAKE_EXPORT_DELAY_MS", "0")):
+                    await asyncio.sleep(delay_ms / 1000.0)
+                if fail_after_publish:
+                    raise RuntimeError("模拟登记失败（测试钩子）：删除已写出的成品")
+                await self._db.insert_export(
+                    export_id=export_id,
+                    turbine=turbine,
+                    day=day,
+                    rel_path=rel_final,
+                    row_count=len(merged),
+                    source_rows=source_rows,
+                    source_file_ids=[f["id"] for f in files],
+                )
+            except BaseException:
+                # 写文件或登记失败 / 中途退出：不留下可下载残件。
+                # 若登记其实已经提交（例如提交后收到取消信号），则保留成品，
+                # 避免出现“有登记、无文件”的悬挂记录。
+                registered = await self._db.get_export(export_id)
+                if registered is not None:
+                    raise
+                if rel_final:
+                    await self._io(
+                        es.delete_file, self._settings.exports_dir, rel_final
+                    )
+                await self._io(es.delete_file, self._settings.exports_dir, rel_tmp)
+                raise
+        finally:
+            await self._db.release_snapshot(snapshot_id)
+
+        return {
+            "export_id": export_id,
+            "turbine": turbine,
+            "day": day,
+            "row_count": len(merged),
+            "source_rows": source_rows,
+            "merged_rows": source_rows - len(merged),
+            "source_file_ids": [f["id"] for f in files],
+            "source_file_count": len(files),
+            "download_url": f"/api/exports/{export_id}/download",
+        }
+
+    async def list_exports(self) -> list[dict[str, object]]:
+        rows = await self._db.list_exports()
+        return [
+            {
+                **dict(r),
+                "download_url": f"/api/exports/{r['id']}/download",
+            }
+            for r in rows
+        ]
+
+    async def get_export(self, export_id: str) -> dict[str, object]:
+        row = await self._db.get_export(export_id)
+        if row is None:
+            raise ExportNotFound(export_id)
+        return {
+            **dict(row),
+            "source_file_ids": await self._db.export_source_file_ids(export_id),
+            "download_url": f"/api/exports/{export_id}/download",
+        }
+
+    def export_abs_path(self, row) -> str:  # noqa: ANN001 - aiosqlite.Row
+        return os.path.join(self._settings.exports_dir, row["path"])
+
+    async def recover_exports(self) -> dict[str, int]:
+        """启动清理：删除未登记临时件与无元数据的孤儿 CSV（已发布文件保留）。"""
+        result = {"temp_removed": 0, "orphans_removed": 0}
+        if not os.path.isdir(self._settings.exports_dir):
+            return result
+        for rel_tmp in await self._io(es.list_temp_paths, self._settings.exports_dir):
+            await self._io(es.delete_file, self._settings.exports_dir, rel_tmp)
+            result["temp_removed"] += 1
+        known = await self._db.all_export_paths()
+        for rel in await self._io(es.list_disk_paths, self._settings.exports_dir):
+            if rel not in known:
+                await self._io(es.delete_file, self._settings.exports_dir, rel)
+                result["orphans_removed"] += 1
+        return result
 
     # ---------------- 统计 / 状态 ----------------
 
